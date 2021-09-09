@@ -1,0 +1,287 @@
+---
+title: "Are statistics out of control?"
+author:
+  - Bénédicte Colnet
+date: "September 2021"
+output:
+  html_document:
+    code_folding: "hide"
+    number_sections: no
+    toc: yes
+    toc_depth: 2
+  pdf_document:
+    toc: yes
+abstract: | 
+  
+  This notebook repeats a [blog article](https://scienceetonnante.com/2021/08/30/les-etudes-statistiques-sont-elles-hors-de-controle/) from David Louapre, using the R language. 
+  The overall analysis is taken from an article *[Statistically Controlling for Confounding Constructs Is Harder than You Think](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0152719)* where the quality of a counfounder is shown to have a big impact on the estimand. 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+library(MASS) # simulation
+library(ggplot2) # beautiful plot
+library(tidyr)
+library(dplyr)
+
+# Seed for reproducibility
+set.seed(1234)
+```
+
+
+# A simple example
+
+Here $z$ is an indicator of life quality, $x$ the champagne consumption (number of glasses per year), and $y$ the life expectancy.
+
+```{r}
+# sample size
+N = 300
+
+# indicator of quality of life (salary in euros / month centered on 2000 euros with sd of 500)
+z = 2000 + 500 * mvrnorm(n = N, 0, 1)
+
+# Champagne 
+x = 0 + 0.01*z + 5 * mvrnorm(n = N, 0, 1)
+
+# Life expectancy - imagine a law that is a normal law centered on 75 years and a positive effect of quality of life
+y = 75 + 0.005 * z + 2.5 * mvrnorm(n = N, 0, 1) 
+
+# observed revenue - basically the true value with noise
+z_obs = z + 500 * mvrnorm(n = N, 0, 1)
+
+simulation <- data.frame("Life.quality" = z,
+                   "Champagne" = x,
+                   "Life.expectancy" = y,
+                   "Observed.salary" = z_obs)
+```
+
+```{r, message = FALSE}
+ggplot(simulation, aes(x = Champagne, y = Life.expectancy)) +
+  geom_point() +
+  theme_classic() +
+  geom_smooth(method = 'lm') +
+  xlab("Champagne (number of glasses per year)") +
+  ylab("Life expectancy (years)")
+```
+A naive correlation analysis between champagne and the life expectancy gives a significant correlation (very small p-value).
+
+```{r}
+cor.test(simulation$Life.expectancy, simulation$Champagne)
+```
+
+We can use the $R^2$ to quantify it:
+
+```{r}
+naive.model <- lm(Life.expectancy ~ Champagne, data = simulation)
+summary(naive.model)
+```
+
+> Note that in the article, due to sampling $R^2 = 0.22$ and p-value $= 10^{-17}$, but our values here are very close.
+
+But we have access to a variable that seems to be more plausible to explain the sprurious correlation.
+
+```{r}
+ggplot(simulation, aes(x = Life.quality, y = Life.expectancy)) +
+  geom_point() +
+  theme_classic() +
+  geom_smooth(method = 'lm') +
+  xlab("Salary ($ / month)") +
+  ylab("Life expectancy (years)")
+
+ggplot(simulation, aes(x = Champagne, y = Life.quality)) +
+  geom_point() +
+  theme_classic() +
+  geom_smooth(method = 'lm') +
+  xlab("Champagne (number of glasses per year)") +
+  ylab("Salary ($ / month)")
+```
+
+Using the true life quality variable (i.e salary in our situation), and adjusting the model with it, then the coefficient associated with champagne is no longer significant.
+
+```{r}
+true.model <- lm(Life.expectancy ~ Champagne + Life.quality, data = simulation)
+summary(true.model)
+```
+
+Here the p-value for the Champagne coefficient is not significant, because bigger than 0.05. In `R` it is rather easy to read it with the stars.
+
+But what if we use a proxy? Rather than the salary, we have access to an observed salary.
+
+```{r}
+simulation %>%
+  pivot_longer(cols = c(Observed.salary, Life.quality), names_to = "Type", values_to = "Salary") %>%
+  ggplot(aes(x = Salary, y = Life.expectancy, color = Type, group = Type)) +
+  geom_point() +
+  theme_classic() +
+  geom_smooth(method = 'lm') +
+  ylab("Life expectancy (years)") +
+  xlab("Salary ($ / month)")
+```
+
+
+```{r}
+proxy.model <- lm(Life.expectancy ~ Champagne + Observed.salary, data = simulation)
+summary(proxy.model)
+```
+
+The coefficient before champagne is significant... This is a statistical artefact, due to the fact that adjustment was made with a proxy rather than the true life quality.
+
+An intuitive way to understand why, is that the true variable is not well approximated by the proxy, so that the "remaining part" is somehow captured by the Champagne covariate.
+
+The conclusion is that - as soon as the proxy covariate is considered as the good one - the Champagne is retained as an explanatory covariate. This is a Type 1 error in statistics.
+
+
+We can also understand this result in term of residual R2, that is:
+
+```{r}
+regress.on.proxy <- lm(Life.expectancy ~ Observed.salary, data = simulation)
+simulation$Life.expect.reduced <- predict(regress.on.proxy)
+
+naive <- lm(Life.expect.reduced ~ Champagne, data = simulation)
+summary(naive)
+```
+
+
+# Toward simulation
+
+To observe how each parameter has an impact, that is the sample size, the quality of the proxy, and the strength of the confounding, one can perform simulations.
+
+```{r}
+compute_simulation <- function(sigma_xy, sigma_z, N = 300){
+  
+  # generate true covariate called z
+  z = 2000 + 500 * mvrnorm(n = N, 0, 1)
+  
+  # generate champagne like covariate
+  x = z + sigma_xy * mvrnorm(n = N, 0, 1)
+  
+  # generate the outcome covariate
+  y = z + sigma_xy * mvrnorm(n = N, 0, 1)
+  
+  # generate the proxy
+  z_obs = z + sigma_z * mvrnorm(n = N, 0, 1)
+  
+  simulation <- data.frame("z" = z,
+                           "x" = x,
+                           "y" = y,
+                           "z_obs" = z_obs)
+  
+  return(simulation)
+}
+```
+
+To reproduce the simulation of *Science Étonnante*, we regress the outcome $y$ on the spurious link $x$ (the Champagne like covariate), and the proxy covariate $z$, that is:
+
+$$y \sim z_{obs} + x,$$
+
+and the p-value found in front of the coefficient for $x$ is analyzed.
+
+```{r}
+test <- compute_simulation(1, 1)
+model.test <- lm(y ~ z_obs + x, data = test)
+model.test <- summary(model.test)
+pvalue <- model.test$coefficients["x", 4]
+pvalue
+```
+
+Intuitively, if we increase the quality of the proxy, this result should change and become no longer significant. For example we propose to divide $\sigma_z$ by 10.
+
+```{r}
+test <- compute_simulation(1, 0.1)
+model.test <- lm(y ~ z_obs + x, data = test)
+model.test <- summary(model.test)
+pvalue <- model.test$coefficients["x", 4]
+pvalue
+```
+
+But we will perform this for several parameters and several times to count the number of false positives, that is the number of time we observe $p-value > 0.05$.
+
+Recall that:
+- The higher $\sigma_z$, the poorer the proxy;
+- The higher $\sigma_{xy}$, the lower the confounding.
+
+
+```{r}
+sigma_z <- c(0.1, 0.2, 0.3, 0.4, 0.5,  0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.2)
+sigma_xy <- c(1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 2)
+K = 100
+
+results <- data.frame("sigma_z" = c(),
+                      "sigma_xy" = c(),
+                      "pvalue" = c(),
+                      "coefficient" = c())
+
+
+for (s_z  in sigma_z){
+  for (s_xy in sigma_xy){
+    for (i in 1:K){
+          test <- compute_simulation(s_xy, s_z)
+          model.test <- lm(y ~ z_obs + x, data = test)
+          model.test <- summary(model.test)
+          pvalue <- model.test$coefficients["x", 4]
+          coefficient <- model.test$coefficients["x", 1]
+          
+          new_row <- data.frame("sigma_z" = s_z,
+                            "sigma_xy" = s_xy,
+                            "pvalue" = pvalue,
+                            "coefficient" = coefficient)
+          results <- rbind(results, new_row)
+    }
+  }
+}
+```
+
+```{r}
+results$false_positive <- ifelse(results$pvalue < 0.05, 1, 0)
+results_treated <- results%>% 
+  group_by(sigma_z, sigma_xy) %>%
+  summarise(total = n(), count = sum(false_positive)) 
+
+
+results_treated$percentage <- round(results_treated$count / 100,2)
+```
+
+```{r}
+ggplot(results_treated, aes(x = sigma_z, y = percentage, group = as.factor(sigma_xy), color = as.factor(sigma_xy))) +
+  geom_point() +
+  geom_line() +
+  theme_minimal() +
+  ylab("False positive percentage") +
+  xlab(expression(sigma[z]))  + 
+  scale_color_discrete(name=expression(sigma[xy]))
+
+# ggplot(results_treated, aes(x = sigma_z, y = percentage, group = as.factor(sigma_xy), color = as.factor(sigma_xy))) +
+#   geom_smooth(se = FALSE) +
+#   theme_minimal() +
+#   ylab("False positive percentage") +
+#   xlab(expression(sigma[z])) + 
+#   scale_color_discrete(name=expression(sigma[xy]))
+#   
+```
+
+We could also observe the effect on the champagne coefficient, that is rather looking at if the quantity is significant or not, how strong this coefficient is.
+
+
+```{r}
+results_coefficient_treated <- results %>%
+  group_by(sigma_z, sigma_xy) %>%
+  summarise(coefficient = mean(coefficient)) 
+```
+
+
+```{r}
+library(ggrepel)
+
+ggplot(results_coefficient_treated, aes(x = sigma_z, y = sigma_xy, z = coefficient)) + 
+  theme_classic() + 
+  geom_contour_filled(palette = "Set1") +
+  xlab(expression(sigma[z])) +
+  ylab(expression(sigma[xy])) + 
+  scale_fill_discrete(name="Coefficient")
+```
+A sensitivity analysis proposes to locate on this plot where we probably are, that is how bad could be our proxy, and how strong could be the counfounder. Would the coeffcient drastically change, then the conclusion of the study are highly dangerous to interpret.
+
+
+
